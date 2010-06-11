@@ -25,6 +25,10 @@
 
 #include <signal.h>
 
+
+int eventfd(unsigned int initval, int flags);
+
+
 /*
  * When specifying the image filename use:
  *
@@ -57,6 +61,7 @@ typedef struct RBDAIOCB {
     int64_t sector_num;
     int aiocnt;
     int error;
+    struct BDRVRBDState *s;
 } RBDAIOCB;
 
 typedef struct RADOSCB {
@@ -68,10 +73,12 @@ typedef struct RADOSCB {
 } RADOSCB;
 
 typedef struct BDRVRBDState {
+    int efd;
     rados_pool_t pool;
     char name[RBD_MAX_OBJ_NAME_SIZE];
     uint64_t size;
     uint64_t objsize;
+    int qemu_aio_count;
 } BDRVRBDState;
 
 typedef struct rbd_obj_header_ondisk RbdHeader1;
@@ -255,6 +262,31 @@ done:
     return ret;
 }
 
+static void rbd_aio_completion_cb(void *opaque)
+{
+    BDRVRBDState *s = opaque;
+
+    uint64_t val;
+    ssize_t ret;
+
+    do {
+        if ((ret = read(s->efd, &val, sizeof(val))) > 0) {
+            s->qemu_aio_count -= val;
+       }
+    } while (ret < 0 && errno == EINTR);
+
+    return;
+}
+
+static int rbd_aio_flush_cb(void *opaque)
+{
+    BDRVRBDState *s = opaque;
+
+    return (s->qemu_aio_count > 0);
+}
+
+
+
 static int rbd_open(BlockDriverState *bs, const char *filename, int flags)
 {
     BDRVRBDState *s = bs->opaque;
@@ -302,6 +334,15 @@ static int rbd_open(BlockDriverState *bs, const char *filename, int flags)
     le64_to_cpus((uint64_t *) & header->image_size);
     s->size = header->image_size;
     s->objsize = 1 << header->options.order;
+
+    s->efd = eventfd(0, 0);
+    if (s->efd < 0) {
+        error_report("error opening eventfd");
+        goto failed;
+    }
+    fcntl(s->efd, F_SETFL, O_NONBLOCK);
+    qemu_aio_set_fd_handler(s->efd, rbd_aio_completion_cb, NULL,
+        rbd_aio_flush_cb, NULL, s);
 
     return 0;
 
@@ -393,10 +434,12 @@ static AIOPool rbd_aio_pool = {
 };
 
 /* This is the callback function for rados_aio_read and _write */
+
 static void rbd_finish_aiocb(rados_completion_t c, RADOSCB *rcb)
 {
     RBDAIOCB *acb = rcb->acb;
     int64_t r;
+    uint64_t buf = 1;
     int i;
 
     acb->aiocnt--;
@@ -427,6 +470,8 @@ static void rbd_finish_aiocb(rados_completion_t c, RADOSCB *rcb)
             acb->ret += r;
         }
     }
+    if (write(acb->s->efd, &buf, sizeof(buf)) < 0)
+        error_report("failed writing to acb->s->efd\n");
     qemu_free(rcb);
     i = 0;
     if (!acb->aiocnt && acb->bh) {
@@ -435,9 +480,11 @@ static void rbd_finish_aiocb(rados_completion_t c, RADOSCB *rcb)
 }
 
 /* Callback when all queued rados_aio requests are complete */
+
 static void rbd_aio_bh_cb(void *opaque)
 {
     RBDAIOCB *acb = opaque;
+    uint64_t buf = 1;
 
     if (!acb->write) {
         qemu_iovec_from_buffer(acb->qiov, acb->bounce, acb->qiov->size);
@@ -446,6 +493,9 @@ static void rbd_aio_bh_cb(void *opaque)
     acb->common.cb(acb->common.opaque, (acb->ret > 0 ? 0 : acb->ret));
     qemu_bh_delete(acb->bh);
     acb->bh = NULL;
+
+    if (write(acb->s->efd, &buf, sizeof(buf)) < 0)
+        error_report("failed writing to acb->s->efd\n");
     qemu_aio_release(acb);
 }
 
@@ -473,6 +523,7 @@ static BlockDriverAIOCB *rbd_aio_rw_vector(BlockDriverState *bs,
     acb->aiocnt = 0;
     acb->ret = 0;
     acb->error = 0;
+    acb->s = s;
 
     if (!acb->bh) {
         acb->bh = qemu_bh_new(rbd_aio_bh_cb, acb);
@@ -492,6 +543,8 @@ static BlockDriverAIOCB *rbd_aio_rw_vector(BlockDriverState *bs,
 
     last_segnr = ((off + size - 1) / s->objsize);
     acb->aiocnt = (last_segnr - segnr) + 1;
+
+    s->qemu_aio_count+=acb->aiocnt + 1; /* All the RADOSCB and the related RBDAIOCB */
 
     while (size > 0) {
         if (size < segsize) {
