@@ -76,6 +76,7 @@ typedef struct BDRVRBDState {
     int efd;
     rados_pool_t pool;
     char name[RBD_MAX_OBJ_NAME_SIZE];
+    char block_name[RBD_MAX_BLOCK_NAME_SIZE];
     uint64_t size;
     uint64_t objsize;
     int qemu_aio_count;
@@ -170,6 +171,39 @@ static int rbd_register_image(rados_pool_t pool, const char *name)
     return ret;
 }
 
+static int touch_rbd_info(rados_pool_t pool, const char *info_oid)
+{
+  int r = rados_write(pool, info_oid, 0, NULL, 0);
+  if (r < 0)
+    return r;
+  return 0;
+}
+
+static int rbd_assign_bid(rados_pool_t pool, uint64_t *id)
+{
+  uint64_t out[1];
+  const char *info_oid = RBD_INFO;
+
+  *id = 0;
+
+  printf("%s:%d\n", __FILE__, __LINE__);
+
+  int r = touch_rbd_info(pool, info_oid);
+  printf("%s:%d\n", __FILE__, __LINE__);
+  if (r < 0)
+    return r;
+  printf("%s:%d\n", __FILE__, __LINE__);
+
+  r = rados_exec(pool, info_oid, "rbd", "assign_bid", NULL, 0, (char *)out, sizeof(out));
+  if (r < 0)
+    return r;
+
+  *id = out[0];
+  le64_to_cpus(out);
+
+  return 0;
+}
+
 static int rbd_create(const char *filename, QEMUOptionParameter *options)
 {
     int64_t bytes = 0;
@@ -182,6 +216,8 @@ static int rbd_create(const char *filename, QEMUOptionParameter *options)
     char name[RBD_MAX_SEG_NAME_SIZE];
     RbdHeader1 header;
     rados_pool_t p;
+    uint64_t bid;
+    uint32_t hi, lo;
     int ret;
 
     if (rbd_parsename(filename, pool, name) < 0) {
@@ -247,6 +283,16 @@ static int rbd_create(const char *filename, QEMUOptionParameter *options)
         ret=-EEXIST;
         goto done;
     }
+
+    ret = rbd_assign_bid(p, &bid);
+    if (ret < 0) {
+        error_report("failed assigning block id");
+        rados_deinitialize();
+        return -EIO;
+    }
+    hi = bid >> 32;
+    lo = bid & 0xFFFFFFFF;
+    snprintf(header.block_name, sizeof(header.block_name), "rb.%x.%x", hi, lo);
 
     /* create header file */
     ret = rados_write(p, n, 0, (const char *)&header, sizeof(header));
@@ -334,6 +380,7 @@ static int rbd_open(BlockDriverState *bs, const char *filename, int flags)
     le64_to_cpus((uint64_t *) & header->image_size);
     s->size = header->image_size;
     s->objsize = 1 << header->options.order;
+    memcpy(s->block_name, header->block_name, sizeof(header->block_name));
 
     s->efd = eventfd(0, 0);
     if (s->efd < 0) {
@@ -380,7 +427,7 @@ static int rbd_rw(BlockDriverState *bs, int64_t sector_num,
             segsize = size;
         }
 
-        snprintf(n, RBD_MAX_SEG_NAME_SIZE, "%s.%012" PRIx64, s->name, segnr);
+        snprintf(n, RBD_MAX_SEG_NAME_SIZE, "%s.%012" PRIx64, s->block_name, segnr);
 
         if (write) {
             if ((r = rados_write(s->pool, n, segoffs, (const char *)buf,
