@@ -13,7 +13,6 @@
 #include "qemu-common.h"
 #include "qemu-error.h"
 
-#include "rbd_types.h"
 #include "block_int.h"
 
 #include <rbd/librbd.h>
@@ -41,6 +40,12 @@
  */
 
 #define OBJ_MAX_SIZE (1UL << OBJ_DEFAULT_OBJ_ORDER)
+
+#define RBD_MAX_CONF_NAME_SIZE 128
+#define RBD_MAX_CONF_VAL_SIZE 512
+#define RBD_MAX_CONF_SIZE 1024
+#define RBD_MAX_POOL_NAME_SIZE 128
+#define RBD_MAX_SNAP_NAME_SIZE 128
 
 typedef struct RBDAIOCB {
     BlockDriverAIOCB common;
@@ -83,9 +88,10 @@ typedef struct RADOSCB {
 
 typedef struct BDRVRBDState {
     int fds[2];
-    rbd_pool_t pool;
+    rados_t cluster;
+    rados_ioctx_t io_ctx;
     rbd_image_t image;
-    char name[RBD_MAX_OBJ_NAME_SIZE];
+    char name[RBD_MAX_IMAGE_NAME_SIZE];
     int qemu_aio_count;
     char *snap;
     int event_reader_pos;
@@ -97,8 +103,6 @@ typedef struct RBDWatchInfo {
     BDRVRBDState *rbd_state;
     RADOSCBOP cbop;
 } RBDWatchInfo;
-
-typedef struct rbd_obj_header_ondisk RbdHeader1;
 
 static void rbd_aio_bh_cb(void *opaque);
 
@@ -178,11 +182,12 @@ static int qemu_rbd_create(const char *filename, QEMUOptionParameter *options)
     int64_t bytes = 0;
     int64_t objsize;
     int obj_order = 0;
-    char pool[RBD_MAX_SEG_NAME_SIZE];
-    char name[RBD_MAX_OBJ_NAME_SIZE];
-    char snap_buf[RBD_MAX_SEG_NAME_SIZE];
+    char pool[RBD_MAX_POOL_NAME_SIZE];
+    char name[RBD_MAX_IMAGE_NAME_SIZE];
+    char snap_buf[RBD_MAX_SNAP_NAME_SIZE];
     char *snap = NULL;
-    rbd_pool_t p;
+    rados_t cluster;
+    rados_ioctx_t io_ctx;
     int ret;
 
     if (qemu_rbd_parsename(filename, pool, sizeof(pool),
@@ -209,26 +214,32 @@ static int qemu_rbd_create(const char *filename, QEMUOptionParameter *options)
                     error_report("obj size too small");
                     return -EINVAL;
                 }
-		obj_order = ffs(objsize) - 1;
+                obj_order = ffs(objsize) - 1;
             }
         }
         options++;
     }
 
-    if (rbd_initialize(0, NULL) < 0) {
+    if (rados_create(&cluster, NULL) < 0) {
         error_report("error initializing");
         return -EIO;
     }
 
-    if (rbd_open_pool(pool, &p)) {
-        error_report("error opening pool %s", pool);
-        rbd_shutdown();
+    if (rados_connect(cluster) < 0) {
+        error_report("error connecting");
+        rados_shutdown(cluster);
         return -EIO;
     }
 
-    ret = rbd_create(p, name, bytes, &obj_order);
-    rbd_close_pool(p);
-    rbd_shutdown();
+    if (rados_ioctx_create(cluster, pool, &io_ctx) < 0) {
+        error_report("error opening pool %s", pool);
+        rados_shutdown(cluster);
+        return -EIO;
+    }
+
+    ret = rbd_create(io_ctx, name, bytes, &obj_order);
+    rados_ioctx_destroy(io_ctx);
+    rados_shutdown(cluster);
 
     return ret;
 }
@@ -260,7 +271,7 @@ static void qemu_rbd_complete_aio(RADOSCB *rcb)
         }
     } else {
         if (r < 0) {
-	    memset(rcb->buf, 0, rcb->size);
+            memset(rcb->buf, 0, rcb->size);
             acb->ret = r;
             acb->error = 1;
         } else if (r < rcb->size) {
@@ -323,9 +334,8 @@ static int qemu_rbd_aio_flush_cb(void *opaque)
 static int qemu_rbd_open(BlockDriverState *bs, const char *filename, int flags)
 {
     BDRVRBDState *s = bs->opaque;
-    RbdHeader1 *header = NULL;
-    char pool[RBD_MAX_SEG_NAME_SIZE];
-    char snap_buf[RBD_MAX_SEG_NAME_SIZE];
+    char pool[RBD_MAX_POOL_NAME_SIZE];
+    char snap_buf[RBD_MAX_SNAP_NAME_SIZE];
     int r;
 
     if (qemu_rbd_parsename(filename, pool, sizeof(pool),
@@ -338,20 +348,28 @@ static int qemu_rbd_open(BlockDriverState *bs, const char *filename, int flags)
         s->snap = qemu_strdup(snap_buf);
     }
 
-    if ((r = rbd_initialize(0, NULL)) < 0) {
+    if ((r = rados_create(&s->cluster, NULL)) < 0) {
         error_report("error initializing");
         return r;
     }
 
-    if ((r = rbd_open_pool(pool, &s->pool))) {
-        error_report("error opening pool %s", pool);
-        rbd_shutdown();
+    if ((r = rados_connect(s->cluster)) < 0) {
+        error_report("error connecting");
+        rados_shutdown(s->cluster);
         return r;
     }
 
-    if ((r = rbd_open_image(s->pool, s->name, &s->image, s->snap)) < 0) {
+    if ((r = rados_ioctx_create(s->cluster, pool, &s->io_ctx))) {
+        error_report("error opening pool %s", pool);
+        rados_shutdown(s->cluster);
+        return r;
+    }
+
+    if ((r = rbd_open(s->io_ctx, s->name, &s->image, s->snap)) < 0) {
         error_report("error reading header from %s", s->name);
-        goto failed;
+        rados_ioctx_destroy(s->io_ctx);
+        rados_shutdown(s->cluster);
+        return r;
     }
 
     bs->read_only = (s->snap != NULL);
@@ -367,15 +385,13 @@ static int qemu_rbd_open(BlockDriverState *bs, const char *filename, int flags)
     qemu_aio_set_fd_handler(s->fds[RBD_FD_READ], qemu_rbd_aio_event_reader,
                             NULL, qemu_rbd_aio_flush_cb, NULL, s);
 
-    qemu_free(header);
 
     return 0;
 
 failed:
-    qemu_free(header);
-    rbd_close_image(s->image);
-    rbd_close_pool(s->pool);
-    rbd_shutdown();
+    rbd_close(s->image);
+    rados_ioctx_destroy(s->io_ctx);
+    rados_shutdown(s->cluster);
     return r;
 }
 
@@ -388,10 +404,10 @@ static void qemu_rbd_close(BlockDriverState *bs)
     qemu_aio_set_fd_handler(s->fds[RBD_FD_READ], NULL , NULL, NULL, NULL,
         NULL);
 
-    rbd_close_image(s->image);
-    rbd_close_pool(s->pool);
+    rbd_close(s->image);
+    rados_ioctx_destroy(s->io_ctx);
     qemu_free(s->snap);
-    rbd_shutdown();
+    rados_shutdown(s->cluster);
 }
 
 /*
@@ -424,10 +440,10 @@ static int qemu_rbd_send_pipe(BDRVRBDState *s, RADOSCBOP *op)
         }
         if (errno == EINTR) {
             continue;
-	}
+        }
         if (errno != EAGAIN) {
             break;
-	}
+        }
 
         FD_ZERO(&wfd);
         FD_SET(fd, &wfd);
@@ -457,7 +473,7 @@ static void rbd_finish_aiocb(rbd_completion_t c, RADOSCB *rcb)
     rcb->cbop.data = rcb;
     ret = qemu_rbd_send_pipe(rcb->s, &rcb->cbop);
     if (ret < 0) {
-        error_report("failed writing to acb->s->fds\n");
+        error_report("failed writing to acb->s->fds");
         qemu_free(rcb);
     }
 }
@@ -559,7 +575,7 @@ static int qemu_rbd_getinfo(BlockDriverState * bs, BlockDriverInfo * bdi)
     rbd_image_info_t info;
     int r;
 
-    r = rbd_stat(s->image, &info);
+    r = rbd_stat(s->image, &info, sizeof(info));
     if (r < 0)
         return r;
 
@@ -573,7 +589,7 @@ static int64_t qemu_rbd_getlength(BlockDriverState * bs)
     rbd_image_info_t info;
     int r;
 
-    r = rbd_stat(s->image, &info);
+    r = rbd_stat(s->image, &info, sizeof(info));
     if (r < 0)
         return r;
 
@@ -603,7 +619,7 @@ static int qemu_rbd_snap_create(BlockDriverState *bs,
         return -ERANGE;
     }
 
-    r = rbd_create_snap(s->image, sn_info->name);
+    r = rbd_snap_create(s->image, sn_info->name);
     if (r < 0) {
         error_report("failed to create snap: %s", strerror(-r));
         return r;
@@ -623,7 +639,7 @@ static int qemu_rbd_snap_list(BlockDriverState *bs,
 
     do {
         snaps = qemu_malloc(sizeof(*snaps) * max_snaps);
-        r = rbd_list_snaps(s->image, snaps, &max_snaps);
+        r = rbd_snap_list(s->image, snaps, &max_snaps);
         if (r < 0)
             qemu_free(snaps);
     } while (r == -ERANGE);
@@ -647,7 +663,7 @@ static int qemu_rbd_snap_list(BlockDriverState *bs,
         sn_info->date_nsec = 0;
         sn_info->vm_clock_nsec = 0;
     }
-    rbd_list_snaps_end(snaps);
+    rbd_snap_list_end(snaps);
 
     *psn_tab = sn_tab;
     return snap_count;
