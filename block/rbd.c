@@ -225,6 +225,12 @@ static int qemu_rbd_create(const char *filename, QEMUOptionParameter *options)
         return -EIO;
     }
 
+    if (rados_conf_read_file(cluster, NULL) < 0) {
+        error_report("error reading config file");
+        rados_shutdown(cluster);
+        return -EIO;
+    }
+
     if (rados_connect(cluster) < 0) {
         error_report("error connecting");
         rados_shutdown(cluster);
@@ -350,6 +356,12 @@ static int qemu_rbd_open(BlockDriverState *bs, const char *filename, int flags)
 
     if ((r = rados_create(&s->cluster, NULL)) < 0) {
         error_report("error initializing");
+        return r;
+    }
+
+    if ((r = rados_conf_read_file(s->cluster, NULL)) < 0) {
+        error_report("error reading config file");
+        rados_shutdown(s->cluster);
         return r;
     }
 
