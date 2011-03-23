@@ -63,18 +63,6 @@ typedef struct RBDAIOCB {
     int cancelled;
 } RBDAIOCB;
 
-struct RADOSCB;
-
-enum {
-    RBD_OP_IO      = 1,
-    RBD_OP_NOTIFY  = 2,
-};
-
-typedef struct RADOSCBOP {
-    int type;
-    void *data;
-} RADOSCBOP;
-
 typedef struct RADOSCB {
     int rcbid;
     RBDAIOCB *acb;
@@ -83,7 +71,6 @@ typedef struct RADOSCB {
     int64_t size;
     char *buf;
     int ret;
-    RADOSCBOP cbop;
 } RADOSCB;
 
 #define RBD_FD_READ 0
@@ -98,19 +85,10 @@ typedef struct BDRVRBDState {
     int qemu_aio_count;
     char *snap;
     int event_reader_pos;
-    RADOSCBOP *event_op;
-    uint64_t watch_handle;
+    RADOSCB *event_rcb;
 } BDRVRBDState;
 
-typedef struct RBDWatchInfo {
-    BDRVRBDState *rbd_state;
-    RADOSCBOP cbop;
-} RBDWatchInfo;
-
 static void rbd_aio_bh_cb(void *opaque);
-
-/* misc forward declarations */
-static int qemu_rbd_send_pipe(BDRVRBDState *s, RADOSCBOP *op);
 
 static int qemu_rbd_next_tok(char *dst, int dst_len,
                              char *src, char delim,
@@ -363,12 +341,6 @@ done:
     qemu_free(rcb);
 }
 
-static void qemu_rbd_handle_event(RADOSCBOP *op)
-{
-    assert (op->type == RBD_OP_IO);
-    qemu_rbd_complete_aio(op->data);
-}
-
 /*
  * aio fd read handler. It runs in the qemu context and calls the
  * completion handling of completed rados aio operations.
@@ -380,16 +352,16 @@ static void qemu_rbd_aio_event_reader(void *opaque)
     ssize_t ret;
 
     do {
-        char *p = (char *)&s->event_op;
+        char *p = (char *)&s->event_rcb;
 
         /* now read the rcb pointer that was sent from a non qemu thread */
         if ((ret = read(s->fds[RBD_FD_READ], p + s->event_reader_pos,
-                        sizeof(s->event_op) - s->event_reader_pos)) > 0) {
+                        sizeof(s->event_rcb) - s->event_reader_pos)) > 0) {
             if (ret > 0) {
                 s->event_reader_pos += ret;
-                if (s->event_reader_pos == sizeof(s->event_op)) {
+                if (s->event_reader_pos == sizeof(s->event_rcb)) {
                     s->event_reader_pos = 0;
-                    qemu_rbd_handle_event(s->event_op);
+                    qemu_rbd_complete_aio(s->event_rcb);
                     s->qemu_aio_count --;
                 }
             }
@@ -513,7 +485,7 @@ static AIOPool rbd_aio_pool = {
     .cancel = qemu_rbd_aio_cancel,
 };
 
-static int qemu_rbd_send_pipe(BDRVRBDState *s, RADOSCBOP *op)
+static int qemu_rbd_send_pipe(BDRVRBDState *s, RADOSCB *rcb)
 {
     int ret = 0;
     while (1) {
@@ -522,7 +494,7 @@ static int qemu_rbd_send_pipe(BDRVRBDState *s, RADOSCBOP *op)
 
         /* send the op pointer to the qemu thread that is responsible
            for the aio/op completion. Must do it in a qemu thread context */
-        ret = write(fd, (void *)&op, sizeof(op));
+        ret = write(fd, (void *)&rcb, sizeof(rcb));
         if (ret >= 0) {
             break;
         }
@@ -557,9 +529,7 @@ static void rbd_finish_aiocb(rbd_completion_t c, RADOSCB *rcb)
     int ret;
     rcb->ret = rbd_aio_get_return_value(c);
     rbd_aio_release(c);
-    rcb->cbop.type = RBD_OP_IO;
-    rcb->cbop.data = rcb;
-    ret = qemu_rbd_send_pipe(rcb->s, &rcb->cbop);
+    ret = qemu_rbd_send_pipe(rcb->s, rcb);
     if (ret < 0) {
         error_report("failed writing to acb->s->fds");
         qemu_free(rcb);
